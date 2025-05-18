@@ -2,11 +2,10 @@ import json
 import argparse
 import re
 import asyncio
-import os
-from typing import List, Dict, Any
-from difflib import SequenceMatcher
+from typing import List, Dict, Any, Tuple
 from sympy import simplify, sympify
 import aiohttp
+
 
 # Utility functions: Formatting and matching
 def normalize_text(text: str) -> str:
@@ -16,7 +15,7 @@ def normalize_text(text: str) -> str:
     text = str(text)
     text = re.sub(r"\s+", " ", text)  # Merge multiple spaces into one
     text = text.strip()  # Remove leading and trailing whitespaces or newlines
-    return text.lower()  # Convert to lowercase for comparison
+    return text.lower()  # Convert text to lowercase for comparison
 
 
 def clean_latex(expr: str) -> str:
@@ -25,25 +24,25 @@ def clean_latex(expr: str) -> str:
         return ""
     expr = str(expr)
 
-    # Replace fraction format: \frac{a}{b} -> (a/b)
+    # Replace fractions: \frac{a}{b} -> (a/b)
     expr = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1/\2)", expr)
 
     # Remove \left and \right markers
     expr = expr.replace(r"\left", "").replace(r"\right", "")
 
-    # Handle square root format: \sqrt{a} -> √a
+    # Replace square root: \sqrt{a} -> √a
     expr = re.sub(r"\\sqrt\{([^{}]+)\}", r"√\1", expr)
 
     # Replace degree symbol: ^{\circ} -> °
     expr = expr.replace("^{\\circ}", "°")
 
-    # Remove dollar signs used in math formulas
+    # Remove dollar signs from math formulas
     expr = expr.replace("$", "")
 
-    # Replace text markers \text{...} -> ...
+    # Replace \text{} marker: \text{...} -> ...
     expr = re.sub(r"\\text\{([^{}]*)\}", r"\1", expr)
 
-    # Replace math symbols
+    # Replace specific math operators
     expr = expr.replace("\\times", "*").replace("\\cdot", "*").replace("÷", "/")
 
     # Remove redundant backslashes
@@ -52,107 +51,43 @@ def clean_latex(expr: str) -> str:
     return expr.strip()
 
 
-def clean_answer(answer: str) -> str:
-    """
-    Clean the extracted answer to retain the primary numeric group.
-    Supports formats like 7,000, 0.77, -0.7, etc.
-    """
-    if answer is None:
-        return ""
-
-    # Remove extra formatting from LaTeX expressions
-    answer = clean_latex(answer)
-
-    # Match the first valid numeric group (including negatives, decimals, and thousand separators)
-    match = re.search(r"-?\d[\d,]*(?:\.\d+)?", answer)
-    if match:
-        # Remove commas from numbers (e.g., 7,000 -> 7000)
-        return match.group(0).replace(",", "")
-    
-    return ""
-
-
-def extract_answer_from_response(response: str) -> str:
-    """
-    Extract the answer from the response:
-    1. Prioritize regex logic that matches formats like Answer:$...$ or ####... .
-    2. Fallback logic applies if the above fails, attempting:
-        - Matching $$...$$
-        - Matching \boxed{} content
-        - Matching the last numeric group.
-    3. Clean the extracted answer using clean_answer.
-    """
-    if response is None:
-        return ""
-
-    # Primary regex logic: prioritize Answer:$...$ or ####... formats
-    ans_re = re.compile(r"(?:Answer:\s*(.+)|#### (\-?[0-9\.\,]+))", re.IGNORECASE)
-    match = ans_re.search(response)
-    if match:
-        # Extract the first match from the groups
-        answer = match.group(1) if match.group(1) else match.group(2)
-        return clean_answer(answer)
-
-    # Fallback logic with additional formats
-    # 1. Try matching `$$...$$`
-    dollar_match = re.search(r"The answer is:\s*\$\$(.+?)\$\$", response, re.IGNORECASE)
-    if dollar_match:
-        return clean_answer(dollar_match.group(1))
-
-    # 2. Try matching `\boxed{}`
-    boxed_match = re.search(r"boxed\{([^{}]+)\}", response, re.IGNORECASE)
-    if boxed_match:
-        return clean_answer(boxed_match.group(1))
-
-    # 3. Try extracting the last numeric group
-    number_matches = re.findall(r"-?\d[\d,]*(?:\.\d+)?", response)
-    if number_matches:
-        return clean_answer(number_matches[-1])
-
-    # Return an empty string if no match is found
-    return ""
-
-
 def normalize_expression(expr: str) -> str:
-    """Normalize mathematical expressions for comparison"""
+    """Normalize mathematical expression for comparison"""
     if expr is None:
         return ""
-
-    # Clean LaTeX expressions
+    
+    # Clean LaTeX expression
     expr = clean_latex(expr)
 
     # Remove all whitespaces
     expr = re.sub(r"\s+", "", expr)
 
-    # Add missing multiplication symbols, e.g., 2(x+1) -> 2*(x+1)
+    # Add missing multiplication operators, e.g., 2(3+4) -> 2*(3+4)
     expr = re.sub(r"(\d)\(", r"\1*(", expr)
 
     # Remove commas from numbers (e.g., 1,000 -> 1000)
     expr = expr.replace(",", "")
 
-    # Remove the 'x=' prefix if present
+    # Remove x= prefix if it exists
     expr = re.sub(r"^x\s*=\s*", "", expr)
-    
+
     return expr.strip()
 
 
 def check_equivalent_expressions(expr1: str, expr2: str) -> bool:
-    """
-    Check whether two mathematical expressions are equivalent:
-    1. Normalize the expressions to remove formatting differences.
-    2. Use sympy to verify mathematical equivalence.
-    """
+    """Check if two mathematical expressions are equivalent"""
     if expr1 is None or expr2 is None:
         return False
 
+    # Normalize both expressions
     expr1 = normalize_expression(expr1)
     expr2 = normalize_expression(expr2)
 
-    # Direct string comparison
+    # Compare normalized text directly
     if normalize_text(expr1) == normalize_text(expr2):
         return True
 
-    # Use sympy for mathematical equivalence checking
+    # Use sympy to check for mathematical equivalence
     try:
         sympy_expr1 = sympify(expr1)
         sympy_expr2 = sympify(expr2)
@@ -164,85 +99,87 @@ def check_equivalent_expressions(expr1: str, expr2: str) -> bool:
     return False
 
 
-def calculate_accuracy(output_data: List[Dict[str, Any]]) -> float:
-    """Calculate the model's answer accuracy"""
-    correct_count = 0
-
-    for item in output_data:
-        response = item.get("response", "")
-        true_answer = item.get("answer", "")
-
-        # Extract final answers
-        true_final_answer = extract_answer_from_response(true_answer)
-        predicted_answer = extract_answer_from_response(response)
-
-        # Check if the answers match
-        is_correct = check_equivalent_expressions(predicted_answer, true_final_answer)
-
-        # Record the result
-        item["predicted_answer"] = predicted_answer
-        item["is_correct"] = is_correct
-
-        if is_correct:
-            correct_count += 1
-
-    accuracy = correct_count / len(output_data) if output_data else 0.0
-    print(f"Correct Answers: {correct_count}/{len(output_data)}, Accuracy: {accuracy:.4f}")
-    return accuracy
+def extract_answer_from_response(response: str) -> str:
+    """Extract the answer from a single model response (matches content after 'Answer:')"""
+    match = re.search(r"Answer:\s*(.+)", response, re.IGNORECASE)
+    if match:
+        return clean_latex(match.group(1).strip())
+    return ""
 
 
-# File operations: Loading and saving
-def load_jsonl_file(file_path: str) -> List[Dict[str, Any]]:
-    """Load data from a JSONL file"""
-    data = []
+def check_answers(predictions: List[str], true_answer: str) -> bool:
+    """Check if any of the candidate answers match the true answer"""
+    for pred in predictions:
+        if check_equivalent_expressions(pred, true_answer):
+            return True
+    return False
+
+
+def load_json_file(file_path: str) -> List[Dict[str, Any]]:
+    """Load data from a JSON file"""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                data.append(json.loads(line.strip()))
+            return json.load(f)
     except Exception as e:
-        print(f"Error reading the JSONL file {file_path}: {e}")
-    return data
+        print(f"Error reading the JSON file {file_path}: {e}")
+    return []
 
 
-def save_jsonl_file(data: List[Dict[str, Any]], file_path: str) -> None:
-    """Save data to a JSONL file"""
+def save_json_file(data: List[Dict[str, Any]], file_path: str) -> None:
+    """Save data to a JSON file"""
     try:
         with open(file_path, "w", encoding="utf-8") as f:
-            for item in data:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            json.dump(data, f, ensure_ascii=False, indent=4)
         print(f"Responses successfully saved to {file_path}")
     except Exception as e:
         print(f"Error saving responses to {file_path}: {e}")
 
 
+def calculate_pass_at_4(output_data: List[Dict[str, Any]]) -> float:
+    """Calculate Pass@4 accuracy for the model"""
+    correct_count = 0
+
+    for item in output_data:
+        predictions = item.get("predicted_answers", [])
+        true_answer = item.get("Answer", "")
+
+        is_correct = check_answers(predictions, true_answer)
+
+        item["is_correct"] = is_correct
+        if is_correct:
+            correct_count += 1
+
+    accuracy = correct_count / len(output_data) if output_data else 0.0
+    print(f"Pass@4 Results: {correct_count}/{len(output_data)}, Pass@4 Accuracy: {accuracy:.4f}")
+    return accuracy
+
+
+# Asynchronous HTTP client for API communication
 class AsyncRequestClient:
-    """Asynchronous HTTP client to interact with the API"""
-    def __init__(self, api_url: str, model_name: str, max_concurrent_requests: int = 30, batch_size: int = 50) -> None:
+    def __init__(self, api_url: str, model_name: str, max_concurrent_requests: int = 30) -> None:
         self.api_url = api_url
         self.model_name = model_name
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
-        self.batch_size = batch_size
         self.session = None
 
     async def create_session(self):
         """Create an HTTP session"""
         self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0))
-        
+
     async def close_session(self):
         """Close the HTTP session"""
         await self.session.close()
-    
+
     async def extract_answer(self, content: str, max_retries: int = 3) -> str:
         """Send a query and extract the answer from the response"""
         payload = {
             "model": self.model_name,
-            "messages": [
-                {"role": "user", "content": content}
-            ],
+            "messages": [{"role": "user", "content": content}],
             "temperature": 0.2,
-            "stream": False
+            "stream": False,
+            "max_tokens": 4096
         }
-        
+
         for attempt in range(max_retries):
             try:
                 async with self.semaphore:
@@ -266,69 +203,71 @@ class AsyncRequestClient:
 
 
 class ResponseGenerator:
-    """Response generator for asynchronous batch processing"""
-    def __init__(self, api_url: str, model_name: str, max_concurrent_requests: int = 30, batch_size: int = 50) -> None:
-        self.client = AsyncRequestClient(api_url, model_name, max_concurrent_requests, batch_size)
+    """Response generator for generating multiple responses to a problem"""
+    def __init__(self, api_url: str, model_name: str, max_concurrent_requests: int = 30) -> None:
+        self.client = AsyncRequestClient(api_url, model_name, max_concurrent_requests)
 
-    async def generate_responses(self, questions: List[str]) -> List[str]:
-        """Generate responses asynchronously for a batch of questions"""
+    async def generate_responses(self, problems: List[str], num_samples: int = 4) -> List[Tuple[List[str], List[str]]]:
+        """Generate multiple independent responses for each problem"""
         await self.client.create_session()
 
-        async def process_question(question: str) -> str:
-            prompt = f"""{question}"""
-            return await self.client.extract_answer(prompt)
+        async def process_problem(problem: str) -> Tuple[List[str], List[str]]:
+            original_responses = []
+            predicted_answers = []
 
-        # Process questions asynchronously
-        tasks = [process_question(question) for question in questions]
-        responses = await asyncio.gather(*tasks)
+            for _ in range(num_samples):  # Generate `num_samples` responses
+                prompt = f"""{problem}"""
+                original_response = await self.client.extract_answer(prompt)
+                extracted_answer = extract_answer_from_response(original_response)
 
-        # Close the session
+                original_responses.append(original_response)
+                predicted_answers.append(extracted_answer)
+
+            return original_responses, predicted_answers
+
+        tasks = [process_problem(problem) for problem in problems]
+        all_responses = await asyncio.gather(*tasks)
+
         await self.client.close_session()
+        return all_responses
 
-        return responses
 
-
-async def main_async(inst_file: str, api_url: str, model_name: str, debug: bool) -> None:
-    # Load input data
-    data = load_jsonl_file(inst_file)
+async def main_async(json_file: str, api_url: str, model_name: str, debug: bool) -> None:
+    """Main asynchronous function"""
+    data = load_json_file(json_file)
 
     if debug:
-        data = data[:10]  # In debug mode, only process the first 10 entries
+        data = data[:10]  # Process only the first 10 items in debug mode
 
-    # Validate input data
-    if not all("question" in item and "answer" in item for item in data):
-        print("Invalid input format. 'question' and 'answer' fields are required in the JSONL file.")
+    if not all("Problem" in item for item in data):
+        print("No 'Problem' fields found in the input JSON file.")
         return
 
-    # Extract questions
-    questions = [item["question"] for item in data]
+    problems = [item["Problem"] for item in data]
+    response_generator = ResponseGenerator(api_url, model_name, max_concurrent_requests=30)
+    responses_with_original = await response_generator.generate_responses(problems, num_samples=4)
 
-    # Initialize generator and generate responses
-    response_generator = ResponseGenerator(api_url, model_name, max_concurrent_requests=30, batch_size=50)
-    responses = await response_generator.generate_responses(questions)
+    output_data = []
+    for item, (original_responses, predicted_answers) in zip(data, responses_with_original):
+        output_data.append({
+            "Problem": item["Problem"],
+            "Answer": item["Answer"],
+            "original_responses": original_responses,
+            "predicted_answers": predicted_answers
+        })
 
-    # Save results and calculate accuracy
-    output_data = [
-        {"question": item["question"], "answer": item["answer"], "response": response}
-        for item, response in zip(data, responses)
-    ]
+    calculate_pass_at_4(output_data)
 
-    # Calculate accuracy
-    calculate_accuracy(output_data)
-
-    # Save outputs
-    output_file = inst_file.rsplit(".", 1)[0] + "_with_responses.jsonl"
-    save_jsonl_file(output_data, output_file)
+    output_file = json_file.rsplit(".", 1)[0] + "_with_responses.json"
+    save_json_file(output_data, output_file)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Response Generation and Accuracy Calculation")
-    parser.add_argument("--inst_file", type=str, required=True, help="Path to the input JSONL file with questions and answers")
+    parser = argparse.ArgumentParser(description="Run Pass@4 Evaluation")
+    parser.add_argument("--json_file", type=str, required=True, help="Path to the input JSON file with problems")
     parser.add_argument("--api_url", type=str, required=True, help="API URL for the model endpoint")
     parser.add_argument("--model_name", type=str, default="default", help="Name of the model to use")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (process a smaller subset)")
 
     args = parser.parse_args()
-
-    # Run asynchronously
-    asyncio.run(main_async(args.inst_file, args.api_url, args.model_name, args.debug))
+    asyncio.run(main_async(args.json_file, args.api_url, args.model_name, args.debug))
